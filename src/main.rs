@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::{ensure, Result};
 use axum::{
@@ -9,29 +9,41 @@ use axum::{
     routing::get,
     BoxError, Json, Router,
 };
-use dotenv::dotenv;
 use lazy_static::lazy_static;
 use listenfd::ListenFd;
-use paris::{error, info, log};
+use paris::{error, info, log, warn};
+use rand::seq::SliceRandom;
 use serde_json::Value;
 use tokio::{net::TcpListener, sync::Mutex};
 use tower::{buffer::BufferLayer, limit::RateLimitLayer, ServiceBuilder};
 
 mod constants;
 
+#[derive(serde::Deserialize)]
+struct Config {
+    port: Option<u16>,
+    api_key: Option<String>,
+    cookies: Vec<String>,
+}
+
 lazy_static! {
     static ref CLIENT: Mutex<SpotifyClient> = Mutex::new(SpotifyClient::new());
+    static ref CONFIG: Config = toml::from_str(
+        &std::fs::read_to_string("config.toml").expect("Failed to read config.toml")
+    )
+    .expect("Failed to parse config.toml");
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv()?;
-
-    // Check if SP_DC is set
     ensure!(
-        std::env::var("SP_DC").is_ok(),
-        "SP_DC is not set. Please set it to your sp_dc cookie value."
+        CONFIG.cookies.len() > 0,
+        "You must provide at least one sp_dc cookie"
     );
+
+    if CONFIG.api_key.is_none() {
+        warn!("No API key provided, this means anyone can use your API");
+    }
 
     // build our application with a route
     let app = Router::new()
@@ -54,12 +66,9 @@ async fn main() -> Result<()> {
         // if we are given a tcp listener on listen fd 0, we use that one
         Some(listener) => TcpListener::from_std(listener).unwrap(),
         // otherwise fall back to local listening
-        None => TcpListener::bind(format!(
-            "127.0.0.1:{}",
-            std::env::var("PORT").unwrap_or("3000".into())
-        ))
-        .await
-        .unwrap(),
+        None => TcpListener::bind(format!("127.0.0.1:{}", CONFIG.port.unwrap_or(3000)))
+            .await
+            .unwrap(),
     };
 
     info!("Listening on <b>{}</>", listener.local_addr().unwrap());
@@ -73,20 +82,22 @@ async fn root() -> String {
 }
 
 async fn lyrics(headers: HeaderMap, Path(track_id): Path<String>) -> Result<Json<Value>, AppError> {
-    let authorization = headers
-        .get("authorization")
-        .ok_or_else(|| anyhow::anyhow!("Authorization header not found"))?;
+    if let Some(api_key) = &CONFIG.api_key {
+        let authorization = headers
+            .get("authorization")
+            .ok_or_else(|| anyhow::anyhow!("Authorization header not found"))?;
 
-    let authorization = authorization.to_str()?;
+        let authorization = authorization.to_str()?;
 
-    let authorization = authorization
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| anyhow::anyhow!("Authorization header not found"))?;
+        let authorization = authorization
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| anyhow::anyhow!("Authorization header not found"))?;
 
-    log!("Authorization: {}", authorization);
+        log!("Authorization: {}", authorization);
 
-    if authorization != std::env::var("API_KEY")? {
-        return Err(anyhow::anyhow!("Invalid API key").into());
+        if authorization != api_key {
+            return Err(anyhow::anyhow!("Invalid API key").into());
+        }
     }
 
     let lyrics = CLIENT.lock().await.get_lyrics(&track_id).await?;
@@ -96,27 +107,31 @@ async fn lyrics(headers: HeaderMap, Path(track_id): Path<String>) -> Result<Json
 
 #[derive(Debug)]
 struct SpotifyClient {
-    access_token: Option<String>,
-    expires_at: Option<u64>,
+    access_tokens: HashMap<String, AccessToken>,
     user_agent: String,
+}
+
+#[derive(Debug)]
+struct AccessToken {
+    token: String,
+    expires_at: u64,
 }
 
 impl SpotifyClient {
     fn new() -> Self {
         Self {
-            access_token: None,
-            expires_at: None,
+            access_tokens: HashMap::new(),
             user_agent: constants::USER_AGENT.to_string(),
         }
     }
 
-    async fn get_access_token(&mut self) -> Result<(), anyhow::Error> {
+    async fn get_access_token(&mut self, cookie: String) -> Result<(), anyhow::Error> {
         let client = reqwest::Client::new();
 
         let response = client
             .get(constants::TOKEN_URL)
             .header("App-platform", "WebPlayer")
-            .header("Cookie", format!("sp_dc={}", std::env::var("SP_DC")?))
+            .header("Cookie", format!("sp_dc={}", cookie))
             .header("User-Agent", &self.user_agent)
             .header("Content-Type", "text/html")
             .send()
@@ -126,41 +141,55 @@ impl SpotifyClient {
 
         let parsed = serde_json::from_str::<Value>(&response.text().await?)?;
 
-        log!("Parsed: {:?}", parsed);
-        // let parsed = response.json::<Value>().await?;
+        // log!("Parsed: {:?}", parsed);
 
-        self.access_token = Some(
-            parsed
-                .get("accessToken")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string(),
-        );
-        self.expires_at = Some(
-            parsed
-                .get("accessTokenExpirationTimestampMs")
-                .unwrap()
-                .as_u64()
-                .unwrap(),
+        self.access_tokens.insert(
+            cookie,
+            AccessToken {
+                token: parsed
+                    .get("accessToken")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                expires_at: parsed
+                    .get("accessTokenExpirationTimestampMs")
+                    .unwrap()
+                    .as_u64()
+                    .unwrap(),
+            },
         );
 
         Ok(())
     }
 
     async fn get_lyrics(&mut self, track_id: &str) -> Result<Value, anyhow::Error> {
-        if self.access_token.is_none()
-            || self.expires_at.is_none()
-            || self.expires_at.unwrap() < (chrono::Utc::now().timestamp_millis() as u64)
-        {
-            log!("Refreshing access token");
-            self.get_access_token().await?;
-            info!("Access token refreshed");
-        }
+        let cookie = CONFIG
+            .cookies
+            .choose(&mut rand::thread_rng())
+            .ok_or_else(|| anyhow::anyhow!("No cookies provided"))?;
+
+        let access_token = self.access_tokens.get(cookie);
+
+        let access_token = match access_token {
+            Some(access_token) => {
+                match access_token.expires_at > chrono::Utc::now().timestamp_millis() as u64 {
+                    true => access_token,
+                    false => {
+                        self.get_access_token(cookie.to_string()).await?;
+                        self.access_tokens.get(cookie).unwrap()
+                    }
+                }
+            }
+            None => {
+                self.get_access_token(cookie.to_string()).await?;
+                self.access_tokens.get(cookie).unwrap()
+            }
+        };
 
         let client = reqwest::Client::new();
 
-        log!("Access Token: {}", self.access_token.as_ref().unwrap());
+        // log!("Access Token: {}", self.access_token.as_ref().unwrap());
 
         let response = client
             .get(format!(
@@ -169,10 +198,7 @@ impl SpotifyClient {
                 track_id,
             ))
             .header("App-platform", "WebPlayer")
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.access_token.as_ref().unwrap()),
-            )
+            .header("Authorization", format!("Bearer {}", access_token.token))
             .header("User-Agent", &self.user_agent)
             .header("Content-Type", "text/html")
             .send()

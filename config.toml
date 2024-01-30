@@ -1,0 +1,7 @@
+# api_key = "***REMOVED***"
+cookies = [
+    "***REMOVED***",
+]
+ratelimit = 10
+ratelimit_reset = 1
+port = 3000
