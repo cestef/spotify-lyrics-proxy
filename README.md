@@ -9,15 +9,15 @@ A simple proxy between the private Spotify API (Musixmatch) and your application
 All configuration is done via the `config.toml` file.
 
 ```toml
-# Optional
-api_key = "smash-your-keyboard-here"
 cookies = [
     "1234567890abcdef",
     "abcdef1234567890",
 ]
-ratelimit = 10
-ratelimit_reset = 1
-# Optional
+# Optional - List of API keys to use (if not provided, the proxy will be open to anyone)
+api_keys = ["smash-your-keyboard-here"]
+# Optional - The number of requests allowed per second (if not provided no ratelimiting will be done)
+ratelimit = 60
+# Optional (default: 3000) - The port to listen on
 port = 3000
 
 ```

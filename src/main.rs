@@ -1,13 +1,12 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use anyhow::{ensure, Result};
 use axum::{
-    error_handling::HandleErrorLayer,
     extract::Path,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    BoxError, Json, Router,
+    Json, Router,
 };
 use lazy_static::lazy_static;
 use listenfd::ListenFd;
@@ -15,14 +14,13 @@ use paris::{error, info, log, warn};
 use rand::seq::SliceRandom;
 use serde_json::Value;
 use tokio::{net::TcpListener, sync::Mutex};
-use tower::{buffer::BufferLayer, limit::RateLimitLayer, ServiceBuilder};
 
 mod constants;
 
 #[derive(serde::Deserialize)]
 struct Config {
     port: Option<u16>,
-    api_key: Option<String>,
+    api_keys: Option<Vec<String>>,
     cookies: Vec<String>,
 }
 
@@ -41,25 +39,14 @@ async fn main() -> Result<()> {
         "You must provide at least one sp_dc cookie"
     );
 
-    if CONFIG.api_key.is_none() {
+    if CONFIG.api_keys.is_none() || CONFIG.api_keys.as_ref().unwrap().len() == 0 {
         warn!("No API key provided, this means anyone can use your API");
     }
 
     // build our application with a route
     let app = Router::new()
         .route("/", get(root))
-        .route("/lyrics/:track_id", get(lyrics))
-        .layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(|err: BoxError| async move {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Unhandled error: {}", err),
-                    )
-                }))
-                .layer(BufferLayer::new(1024))
-                .layer(RateLimitLayer::new(5, Duration::from_secs(1))),
-        );
+        .route("/lyrics/:track_id", get(lyrics));
 
     let mut listenfd = ListenFd::from_env();
     let listener = match listenfd.take_tcp_listener(0).unwrap() {
@@ -82,7 +69,7 @@ async fn root() -> String {
 }
 
 async fn lyrics(headers: HeaderMap, Path(track_id): Path<String>) -> Result<Json<Value>, AppError> {
-    if let Some(api_key) = &CONFIG.api_key {
+    if let Some(api_keys) = &CONFIG.api_keys {
         let authorization = headers
             .get("authorization")
             .ok_or_else(|| anyhow::anyhow!("Authorization header not found"))?;
@@ -95,7 +82,7 @@ async fn lyrics(headers: HeaderMap, Path(track_id): Path<String>) -> Result<Json
 
         log!("Authorization: {}", authorization);
 
-        if authorization != api_key {
+        if !api_keys.contains(&authorization.to_string()) {
             return Err(anyhow::anyhow!("Invalid API key").into());
         }
     }
