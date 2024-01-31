@@ -9,6 +9,7 @@ A simple proxy between the private Spotify API (Musixmatch) and your application
 All configuration is done via the `config.toml` file.
 
 ```toml
+# Required - List of cookies (`sp_dc`) to use
 cookies = [
     "1234567890abcdef",
     "abcdef1234567890",
